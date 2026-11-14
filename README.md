@@ -8,10 +8,14 @@ and still report **"finished"**. You get a file of the right size that is partly
 zeros, and a video that breaks halfway through. `safedl` avoids that, and fixes
 files that already ended up that way.
 
-- **One connection, endless resume.** If the connection drops or stalls
+- **Several connections, endless resume.** The file is split into pieces and
+  downloaded over 4 connections by default (`-c 1` to `-c 16`), which helps on
+  servers that limit the speed of each connection. If a connection drops or stalls
   (< 10 KB/s for 45 s), it waits and continues from the exact byte where it stopped.
-- **Never looks done when it isn't.** The download is written to `file.part` and
-  renamed only after every byte has arrived.
+- **Never looks done when it isn't.** How far each piece got is saved to
+  `file.part.json` every few seconds, so a pause, crash or dropped connection never
+  leaves a gap that is counted as downloaded. The download is written to `file.part`
+  and renamed only after every byte of every piece has arrived.
 - **Repairs broken downloads in place.** It finds the never-downloaded (zero-filled)
   parts of a file from any downloader and fetches only those with HTTP Range requests,
   keeping everything that is already good. Truncated files are completed too.
@@ -42,6 +46,8 @@ chmod +x ~/.local/bin/safedl
 safedl get "https://example.com/big-file.mp4"            # into ~/Downloads
 safedl get "https://example.com/big-file.mp4" -d ~/Movies
 safedl get "https://example.com/big-file.mp4" -o ~/Movies/film.mp4
+safedl get "https://example.com/big-file.mp4" -c 8         # 8 connections
+safedl get "https://example.com/big-file.mp4" -c 1         # gentlest on the server
 ```
 
 Press Ctrl+C to pause. Run the same command again to resume. If the file already
@@ -51,8 +57,9 @@ exists, `get` checks it and downloads only what is missing.
 safedl repair ~/Downloads/broken.mp4 "https://example.com/big-file.mp4"
 ```
 
-This fetches only the missing parts of a file that another downloader left broken.
-The server must support byte ranges, which almost all file hosts do.
+This fetches only the missing parts of a file that another downloader left broken,
+also over several connections (`-c`). The server must support byte ranges, which
+almost all file hosts do. If it doesn't, `get` falls back to one plain download.
 
 ```bash
 safedl check ~/Downloads/film.mp4
