@@ -33,6 +33,7 @@ from urllib.parse import unquote, urlparse
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
 BLOCK = 1 << 20              # scan / repair granularity (1 MiB)
 ZERO_RUN = b"\0" * 1024      # a block holding this many zeros in a row counts as "not downloaded"
+ZERO_RUN_RE = re.compile(rb"\0{1024,}")
 CHUNK = 256 * 1024
 MAX_FAILS = 60               # consecutive attempts without progress before giving up
 DEFAULT_CONNS, MAX_CONNS = 4, 16
@@ -103,15 +104,49 @@ def probe(url):
 
 
 # ---------------------------------------------------------------- checks
+def padding_size(buf, start):
+    """If the zeros at buf[start:] are the payload of padding a file format declares on purpose,
+    return the declared payload size, else None. Knows MKV/WebM Void elements and MP4 free/skip."""
+    for vlen in range(1, 9):                     # MKV/WebM: 0xEC, EBML size (vlen bytes), zeros
+        h = start - 1 - vlen
+        if h < 0:
+            break
+        first = buf[h + 1]
+        if buf[h] == 0xEC and first and 9 - first.bit_length() == vlen:
+            return int.from_bytes(buf[h + 1:h + 1 + vlen], "big") & ((1 << (7 * vlen)) - 1)
+    h = start - 8                                # MP4: 32-bit size, b"free"/b"skip", zeros
+    if h >= 0 and buf[h + 4:h + 8] in (b"free", b"skip"):
+        return int.from_bytes(buf[h:h + 4], "big") - 8
+    return None
+
+
+def block_is_missing(buf, carry):
+    """Does this block hold a long zero run that no declared padding explains?
+    `carry` = declared padding bytes continuing from the previous block.
+    Returns (missing, carry for the next block)."""
+    if ZERO_RUN not in buf:
+        return False, 0
+    missing, nxt = False, 0
+    for m in ZERO_RUN_RE.finditer(buf):
+        s, n = m.start(), m.end() - m.start()
+        declared = carry if s == 0 and carry else padding_size(buf, s)
+        if declared is not None and n <= declared + 4:   # +4: next header may start with zeros
+            if m.end() == len(buf):
+                nxt = max(0, declared - n)
+            continue
+        missing = True
+    return missing, nxt
+
+
 def find_holes(path, size):
     """Byte ranges (inclusive) that look never-downloaded: zero-filled blocks or a short tail."""
-    holes, cur, i = [], None, 0
+    holes, cur, i, carry = [], None, 0, 0
     with open(path, "rb") as f:
         while True:
             b = f.read(BLOCK)
             if not b:
                 break
-            bad = ZERO_RUN in b
+            bad, carry = block_is_missing(b, carry)
             if bad and cur is None:
                 cur = i
             elif not bad and cur is not None:
@@ -135,14 +170,18 @@ def play_test(path):
     if not shutil.which("ffmpeg"):
         return None, "ffmpeg not installed (brew install ffmpeg)"
     say("Play-testing every frame with ffmpeg (about a minute per GB)...")
-    r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", "0", "-f", "null", "-"],
+    # video and audio only: the null output cannot take subtitle/attachment tracks
+    r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path),
+                        "-map", "0:v?", "-map", "0:a?", "-f", "null", "-"],
                        capture_output=True, text=True)
     errors = [ln for ln in r.stderr.splitlines() if ln.strip()]
     return (r.returncode == 0 and not errors), errors[:5]
 
 
-def report(path, size):
-    holes = find_holes(path, size)
+def report(path, size, genuine=()):
+    """genuine: ranges just verified against the server - zeros there are really in the file."""
+    holes = [h for h in find_holes(path, size)
+             if not any(s <= h[0] and h[1] <= e for s, e in genuine)]
     missing = sum(e - s + 1 for s, e in holes)
     if holes:
         say(f"Missing data: {human(missing)} in {len(holes)} place(s): "
@@ -163,7 +202,7 @@ def report(path, size):
 class Progress:
     def __init__(self, total):
         self.total, self.done, self.t0, self.last = total, 0, time.time(), 0
-        self.lock = threading.Lock()
+        self.lock, self.width = threading.Lock(), 0
 
     def add(self, n):
         with self.lock:
@@ -173,8 +212,10 @@ class Progress:
                 self.last = now
                 speed = self.done / max(now - self.t0, 0.001)
                 eta = (self.total - self.done) / speed if speed else 0
-                print(f"\r  {human(self.done)} / {human(self.total)}  {human(speed)}/s  "
-                      f"~{int(eta // 60)}m{int(eta % 60):02d}s left   ", end="", flush=True)
+                line = (f"  {human(self.done)} / {human(self.total)}  {human(speed)}/s  "
+                        f"~{int(eta // 60)}m{int(eta % 60):02d}s left")
+                self.width = max(self.width, len(line))   # pad over a longer previous line
+                print("\r" + line.ljust(self.width), end="", flush=True)
 
     def note(self, msg):
         with self.lock:
@@ -204,11 +245,12 @@ def check_range_reply(hdr_file, pos):
 class Fetcher:
     """Downloads byte ranges of one URL into one file, over several connections at once."""
 
-    def __init__(self, url, path, prog):
+    def __init__(self, url, path, prog, compare=False):
         self.url, self.path, self.prog = url, Path(path), prog
         self.inode = self.path.stat().st_ino
         self.stop = threading.Event()
         self.procs, self.plock = set(), threading.Lock()
+        self.compare, self.same = compare, 0   # compare: count bytes that were already correct
 
     def fetch(self, start, end, on_data, hdr_file):
         """Write bytes start..end into the file at the same offsets, resuming after drops."""
@@ -233,6 +275,11 @@ class Fetcher:
                         if not checked:
                             check_range_reply(hdr_file, pos)
                             checked = True
+                        if self.compare:
+                            if out.read(len(data)) == data:
+                                with self.plock:
+                                    self.same += len(data)
+                            out.seek(pos)
                         out.write(data)
                         pos += len(data)
                         on_data(pos, len(data))
@@ -333,6 +380,7 @@ def check_space(folder, need):
 
 # ---------------------------------------------------------------- repair
 def repair(path, url, rem, conns):
+    """Fetch the parts that look missing. Returns ranges whose zeros turned out to be genuine."""
     path = Path(path)
     have = path.stat().st_size
     if rem.size is None:
@@ -342,8 +390,7 @@ def repair(path, url, rem, conns):
                     "It is a different file - download it again with `safedl get`.")
     holes = find_holes(path, rem.size)
     if not holes:
-        say("No missing parts found.")
-        return
+        return []                     # report() says "No missing parts found."
     missing = sum(e - s + 1 for s, e in holes)
     check_space(path.parent, missing)
     if have < rem.size:
@@ -353,11 +400,16 @@ def repair(path, url, rem, conns):
     n = min(conns, len(chunks))
     say(f"Re-downloading {human(missing)} in {len(holes)} place(s) over {n} connection(s), "
         "keeping everything else.")
-    Fetcher(url, path, Progress(missing)).run(chunks, conns)
+    f = Fetcher(url, path, Progress(missing), compare=True)
+    f.run(chunks, conns)        # raises unless every byte of every flagged part arrived
     print()
-    if find_holes(path, rem.size):
-        raise Fatal("Some parts are still missing; run the command again.")
-    say("All missing parts downloaded.")
+    # those parts now hold exactly the server's bytes, so zeros still there are really in the file
+    if f.same == missing:
+        say(f"Nothing was missing: the {human(missing)} that looked empty really is empty padding "
+            "inside the file (the server sent the same bytes).")
+    else:
+        say(f"Missing parts downloaded ({human(missing - f.same)} was actually missing).")
+    return find_holes(path, rem.size)
 
 
 # ---------------------------------------------------------------- full download
@@ -434,8 +486,8 @@ def cmd_get(a):
 
     if dest.exists():
         say("File already exists - checking it and fetching only what is missing.")
-        repair(dest, a.url, rem, a.connections)
-        _, ok = report(dest, rem.size)
+        genuine = repair(dest, a.url, rem, a.connections)
+        _, ok = report(dest, rem.size, genuine)
         notify(f"{dest.name}: {'ready' if ok is not False else 'still broken'}")
         return 0 if ok is not False else 1
 
@@ -513,8 +565,8 @@ def main():
             sys.exit(cmd_get(a))
         elif a.cmd == "repair":
             rem = probe(a.url)
-            repair(a.file, a.url, rem, a.connections)
-            _, ok = report(a.file, rem.size)
+            genuine = repair(a.file, a.url, rem, a.connections)
+            _, ok = report(a.file, rem.size, genuine)
             notify(f"{Path(a.file).name}: {'ready' if ok is not False else 'still broken'}")
             sys.exit(0 if ok is not False else 1)
         else:

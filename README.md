@@ -70,10 +70,15 @@ This reports any missing parts and play-tests the file. It downloads nothing.
 ## How missing parts are detected
 
 The file is scanned in 1 MiB blocks. A block that contains 1 KiB or more of
-consecutive zero bytes counts as not downloaded and is fetched again. Compressed
-media almost never contains runs of zeros that long, so false positives are rare.
-When one does happen, it only costs a re-download of that block. The `ffmpeg`
-play-test catches any damage that isn't zero-filled.
+consecutive zero bytes counts as not downloaded and is fetched again, except for
+padding that the file format declares on purpose: MKV/WebM `Void` elements and MP4
+`free`/`skip` boxes. Muxers such as mkvmerge reserve a few KB of zeros near the
+start of almost every MKV file.
+
+Any other zeros are checked against the server. If the server sends back the same
+zeros, they really are part of the file, and safedl says so instead of reporting
+them as missing. The `ffmpeg` play-test (video and audio tracks) catches any damage
+that isn't zero-filled.
 
 ## License
 
